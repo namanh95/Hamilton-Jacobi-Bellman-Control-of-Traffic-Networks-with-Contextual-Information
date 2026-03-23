@@ -1,0 +1,105 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Figure 3: Sensitivity of network congestion dynamics
+#           to contextual disturbance intensity
+# ============================================================
+
+np.random.seed(42)
+
+# Time horizon
+T = 121
+t = np.arange(T)
+
+# ------------------------------------------------------------
+# Contextual shock profile x(t): smooth transient disturbance
+# ------------------------------------------------------------
+def gaussian_shock(t, center=60, width=16):
+    return np.exp(-0.5 * ((t - center) / width) ** 2)
+
+x_t = gaussian_shock(t, center=60, width=16)
+
+# ------------------------------------------------------------
+# Stylized urban-core accumulation dynamics
+#
+# n_{t+1} = n_t + inflow - outflow
+#
+# Effective outflow degrades with contextual intensity gamma*x(t)
+# and worsens when accumulation is high.
+# ------------------------------------------------------------
+def simulate_accumulation(gamma, T=121):
+    t = np.arange(T)
+    x_t = gaussian_shock(t, center=60, width=16)
+
+    n = np.zeros(T)
+    n[0] = 120.0   # initial accumulation in urban core
+
+    # Baseline parameters
+    inflow_base = 18.0
+    outflow_base = 22.0
+
+    for k in range(T - 1):
+        # contextual demand pressure
+        inflow = inflow_base + 4.0 * x_t[k]
+
+        # context-dependent capacity degradation
+        effective_capacity = outflow_base * (1.0 - gamma * x_t[k])
+
+        # congestion friction term
+        congestion_penalty = 0.015 * n[k]
+
+        # stylized contextual HJB stabilization effect:
+        # stronger regulation under larger shock and larger accumulation
+        control_effect = 0.06 * n[k] / (1.0 + 0.5 * gamma) + 3.5 * gamma * x_t[k]
+
+        # net outflow after control and congestion
+        outflow = max(effective_capacity + control_effect - congestion_penalty, 0.0)
+
+        # discrete-time update
+        n[k + 1] = max(n[k] + inflow - outflow, 0.0)
+
+    return n, x_t
+
+
+# ------------------------------------------------------------
+# Simulate three disturbance regimes
+# ------------------------------------------------------------
+gammas = [0.2, 0.4, 0.6]
+labels = [
+    r"Mild disturbance ($\gamma = 0.2$)",
+    r"Moderate disturbance ($\gamma = 0.4$)",
+    r"Severe disturbance ($\gamma = 0.6$)"
+]
+
+results = [simulate_accumulation(gamma, T=T)[0] for gamma in gammas]
+shock_profile = simulate_accumulation(0.2, T=T)[1]
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+for n, label in zip(results, labels):
+    ax1.plot(t, n, linewidth=2.2, label=label)
+
+ax1.set_xlabel("Time (minutes)", fontsize=12)
+ax1.set_ylabel(r"Urban-core vehicle accumulation $n_1(t)$", fontsize=12)
+ax1.set_title("Sensitivity of Network Congestion Dynamics to Contextual Disturbance Intensity", fontsize=14)
+ax1.grid(True, alpha=0.3)
+ax1.legend(loc="upper left", fontsize=10)
+
+# Secondary axis for contextual shock profile
+ax2 = ax1.twinx()
+ax2.fill_between(t, shock_profile, color="gray", alpha=0.22, label=r"Shock profile $x(t)$")
+ax2.set_ylabel("Shock intensity", fontsize=12)
+ax2.set_ylim(0, 1.05)
+
+# Optional legend entry for shaded shock
+handles1, labels1 = ax1.get_legend_handles_labels()
+handles2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(handles1 + handles2, labels1 + labels2, loc="upper right", fontsize=10)
+
+plt.tight_layout()
+plt.savefig("figure3_sensitivity_analysis.png", dpi=300, bbox_inches="tight")
+plt.show()
