@@ -1,0 +1,868 @@
+# ============================================================
+# Section 5 Experiments for:
+# "Hamilton-Jacobi-Bellman Control of Traffic Networks
+#  with Contextual Information"
+#
+# Author: ChatGPT
+# Purpose:
+#   Stylized numerical experiments for:
+#   1) transient shock stabilization
+#   2) throughput recovery under persistent degradation
+#   3) value of contextual information
+#   4) computational surrogate comparison
+#
+# Notes:
+#   - This is a stylized macroscopic discrete-time network simulator.
+#   - The "contextual_hjb" controller is an HJB-inspired receding-horizon
+#     feedback controller using true context and one-step lookahead
+#     with a terminal penalty.
+#   - The "predict_then_optimize" controller uses forecasted context.
+#   - The "state_feedback" controller uses traffic state only.
+#
+# Dependencies:
+#   pip install numpy matplotlib pandas scikit-learn
+# ============================================================
+
+import time
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Callable, Optional
+
+from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+
+
+# ============================================================
+# 1. GLOBAL CONFIG
+# ============================================================
+
+np.random.seed(42)
+plt.rcParams["figure.figsize"] = (10, 5)
+
+EPS = 1e-9
+
+
+# ============================================================
+# 2. NETWORK / SIMULATION MODEL
+# ============================================================
+
+@dataclass
+class NetworkParams:
+    # Free-flow / nominal capacities for 4 links in a diamond network
+    # Route A: link 0 -> link 2
+    # Route B: link 1 -> link 3
+    base_caps: np.ndarray           # shape (4,)
+    storage_caps: np.ndarray        # shape (4,)
+    free_flow_cost: np.ndarray      # shape (4,)
+    dt: float = 1.0
+
+
+@dataclass
+class SimConfig:
+    T: int
+    demand_profile: np.ndarray      # length T
+    context_profile: np.ndarray     # shape (T, 3): [weather, incident, event]
+    controller_name: str
+    forecast_noise_std: float = 0.10
+    info_mode: str = "full"         # "none", "partial", "full"
+    severity_label: str = "medium"
+
+
+def contextual_capacities(base_caps: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """
+    Context x = [weather, incident, event]
+    Each component in [0,1].
+
+    Interpretation:
+      weather  -> broad network capacity reduction
+      incident -> stronger reduction on Route A downstream bottleneck
+      event    -> modest reduction due to turbulence / friction
+    """
+    weather, incident, event = x
+
+    caps = base_caps.copy().astype(float)
+
+    # Broad weather reduction
+    caps *= (1.0 - 0.20 * weather)
+
+    # Event-induced friction on upstream links
+    caps[0] *= (1.0 - 0.05 * event)
+    caps[1] *= (1.0 - 0.05 * event)
+
+    # Incident mainly hits Route A downstream bottleneck + some upstream effect
+    caps[2] *= (1.0 - 0.50 * incident)
+    caps[0] *= (1.0 - 0.10 * incident)
+
+    # Keep capacities positive
+    caps = np.maximum(caps, 0.05 * base_caps)
+    return caps
+
+
+def stage_cost(
+    q: np.ndarray,
+    u: np.ndarray,
+    caps: np.ndarray,
+    free_flow_cost: np.ndarray,
+    smooth_u_prev: Optional[np.ndarray] = None,
+    spillback_penalty: float = 20.0,
+) -> float:
+    """
+    Stylized stage cost:
+      congestion cost + mild control effort + spillback penalty
+    u = [alpha, meter]
+      alpha in [0,1] : fraction of demand to Route A
+      meter in [0,1] : metering factor applied to total source inflow
+    """
+    alpha, meter = u
+    route_a_q = q[0] + q[2]
+    route_b_q = q[1] + q[3]
+
+    queue_cost = np.sum(q)
+    weighted_delay = np.dot(q, free_flow_cost)
+
+    # penalize near-storage overflow
+    spill_cost = spillback_penalty * np.sum(np.maximum(q / (caps + EPS) - 4.0, 0.0))
+
+    control_cost = 0.5 * (alpha - 0.5) ** 2 + 0.5 * (1.0 - meter) ** 2
+    if smooth_u_prev is not None:
+        control_cost += 0.25 * np.sum((u - smooth_u_prev) ** 2)
+
+    # small imbalance term
+    balance_cost = 0.2 * abs(route_a_q - route_b_q)
+
+    return queue_cost + 0.2 * weighted_delay + spill_cost + control_cost + balance_cost
+
+
+def simulate_one_step(
+    q: np.ndarray,
+    demand: float,
+    x: np.ndarray,
+    u: np.ndarray,
+    params: NetworkParams,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Discrete-time queue dynamics on a diamond network.
+
+    Links:
+      0: upstream A
+      1: upstream B
+      2: downstream A
+      3: downstream B
+
+    Control:
+      alpha = fraction of metered inflow to Route A
+      meter = source metering in [0,1]
+    """
+    alpha, meter = u
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    meter = float(np.clip(meter, 0.0, 1.0))
+
+    caps = contextual_capacities(params.base_caps, x)
+
+    # Effective metered inflow
+    source_in = meter * demand
+    in0 = alpha * source_in
+    in1 = (1.0 - alpha) * source_in
+
+    # Service/outflow from each queue
+    out0 = min(q[0], caps[0])
+    out1 = min(q[1], caps[1])
+    out2 = min(q[2], caps[2])
+    out3 = min(q[3], caps[3])
+
+    # Queue transitions
+    q_next = np.zeros_like(q)
+    q_next[0] = q[0] + in0 - out0
+    q_next[1] = q[1] + in1 - out1
+    q_next[2] = q[2] + out0 - out2
+    q_next[3] = q[3] + out1 - out3
+
+    # Storage truncation
+    q_next = np.minimum(np.maximum(q_next, 0.0), params.storage_caps)
+
+    # Throughput = exit from downstream links
+    throughput = out2 + out3
+
+    metrics = {
+        "throughput": throughput,
+        "inflow": source_in,
+        "spillback_links": int(np.sum(q_next >= 0.95 * params.storage_caps)),
+        "caps_mean": float(np.mean(caps)),
+        "caps_route_a": float(caps[0] + caps[2]),
+        "caps_route_b": float(caps[1] + caps[3]),
+    }
+    return q_next, metrics
+
+
+# ============================================================
+# 3. CONTROLLERS
+# ============================================================
+
+def make_candidate_controls() -> List[np.ndarray]:
+    alphas = np.linspace(0.05, 0.95, 10)
+    meters = np.linspace(0.50, 1.00, 6)
+    return [np.array([a, m]) for a in alphas for m in meters]
+
+
+CANDIDATE_U = make_candidate_controls()
+
+
+def observed_context(x_true: np.ndarray, mode: str) -> np.ndarray:
+    """
+    Information regimes:
+      none    -> controller sees zero context
+      partial -> weather + incident, but not event
+      full    -> all components
+    """
+    if mode == "none":
+        return np.zeros_like(x_true)
+    if mode == "partial":
+        x = x_true.copy()
+        x[2] = 0.0
+        return x
+    if mode == "full":
+        return x_true.copy()
+    raise ValueError(f"Unknown info_mode={mode}")
+
+
+def forecast_context(x_true: np.ndarray, noise_std: float) -> np.ndarray:
+    x_hat = x_true + np.random.normal(0.0, noise_std, size=x_true.shape)
+    return np.clip(x_hat, 0.0, 1.0)
+
+
+def controller_no_control(
+    q: np.ndarray,
+    demand: float,
+    x_true: np.ndarray,
+    t: int,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray] = None,
+    info_mode: str = "full",
+    forecast_noise_std: float = 0.10,
+) -> np.ndarray:
+    return np.array([0.50, 1.00])
+
+
+def controller_static(
+    q: np.ndarray,
+    demand: float,
+    x_true: np.ndarray,
+    t: int,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray] = None,
+    info_mode: str = "full",
+    forecast_noise_std: float = 0.10,
+) -> np.ndarray:
+    # Slight nominal preference for Route B, assuming Route A is more incident-prone
+    return np.array([0.40, 0.90])
+
+
+def controller_state_feedback(
+    q: np.ndarray,
+    demand: float,
+    x_true: np.ndarray,
+    t: int,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray] = None,
+    info_mode: str = "none",
+    forecast_noise_std: float = 0.10,
+) -> np.ndarray:
+    """
+    State-only controller:
+      route away from more congested route
+      meter if downstream queues are large
+    """
+    route_a_q = q[0] + q[2]
+    route_b_q = q[1] + q[3]
+
+    # soft routing away from larger route queue
+    diff = route_b_q - route_a_q
+    alpha = 1.0 / (1.0 + np.exp(-0.10 * diff))
+    alpha = float(np.clip(alpha, 0.10, 0.90))
+
+    downstream_q = q[2] + q[3]
+    meter = 1.0 if downstream_q < 40 else 0.85 if downstream_q < 80 else 0.70
+    return np.array([alpha, meter])
+
+
+def choose_best_candidate(
+    q: np.ndarray,
+    demand: float,
+    x_for_control: np.ndarray,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray],
+    horizon_terminal_weight: float = 1.0,
+) -> np.ndarray:
+    """
+    One-step lookahead + terminal penalty.
+    This is the HJB-inspired discrete approximation.
+    """
+    best_cost = np.inf
+    best_u = CANDIDATE_U[0]
+
+    for u in CANDIDATE_U:
+        q_next, _ = simulate_one_step(q, demand, x_for_control, u, params)
+        caps = contextual_capacities(params.base_caps, x_for_control)
+
+        c1 = stage_cost(
+            q=q,
+            u=u,
+            caps=caps,
+            free_flow_cost=params.free_flow_cost,
+            smooth_u_prev=u_prev,
+        )
+
+        # Terminal surrogate
+        route_a_next = q_next[0] + q_next[2]
+        route_b_next = q_next[1] + q_next[3]
+        terminal = (
+            np.sum(q_next)
+            + 0.25 * (route_a_next - route_b_next) ** 2
+            + 0.10 * np.sum((q_next / (params.storage_caps + EPS)) ** 2)
+        )
+
+        total = c1 + horizon_terminal_weight * terminal
+
+        if total < best_cost:
+            best_cost = total
+            best_u = u
+
+    return best_u.copy()
+
+
+def controller_predict_then_optimize(
+    q: np.ndarray,
+    demand: float,
+    x_true: np.ndarray,
+    t: int,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray] = None,
+    info_mode: str = "full",
+    forecast_noise_std: float = 0.10,
+) -> np.ndarray:
+    x_hat = forecast_context(observed_context(x_true, info_mode), forecast_noise_std)
+    return choose_best_candidate(q, demand, x_hat, params, u_prev, horizon_terminal_weight=0.8)
+
+
+def controller_contextual_hjb(
+    q: np.ndarray,
+    demand: float,
+    x_true: np.ndarray,
+    t: int,
+    params: NetworkParams,
+    u_prev: Optional[np.ndarray] = None,
+    info_mode: str = "full",
+    forecast_noise_std: float = 0.10,
+) -> np.ndarray:
+    x_obs = observed_context(x_true, info_mode)
+    return choose_best_candidate(q, demand, x_obs, params, u_prev, horizon_terminal_weight=1.2)
+
+
+CONTROLLERS: Dict[str, Callable] = {
+    "no_control": controller_no_control,
+    "static": controller_static,
+    "state_feedback": controller_state_feedback,
+    "predict_then_optimize": controller_predict_then_optimize,
+    "contextual_hjb": controller_contextual_hjb,
+}
+
+
+# ============================================================
+# 4. SCENARIO GENERATION
+# ============================================================
+
+def triangular_pulse(T: int, start: int, peak: int, end: int, amplitude: float) -> np.ndarray:
+    y = np.zeros(T)
+    for t in range(T):
+        if start <= t <= peak:
+            y[t] = amplitude * (t - start) / max(peak - start, 1)
+        elif peak < t <= end:
+            y[t] = amplitude * (end - t) / max(end - peak, 1)
+    return y
+
+
+def persistent_level(T: int, level: float, start: int = 10) -> np.ndarray:
+    y = np.zeros(T)
+    y[start:] = level
+    return y
+
+
+def make_transient_shock_scenario(T: int = 120, severity: float = 0.7) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Transient combined shock:
+      - weather pulse
+      - incident pulse
+      - event-related demand pulse
+    """
+    weather = triangular_pulse(T, 20, 35, 60, 0.8 * severity)
+    incident = triangular_pulse(T, 30, 40, 55, 1.0 * severity)
+    event = triangular_pulse(T, 15, 30, 70, 0.7 * severity)
+
+    x = np.vstack([weather, incident, event]).T
+
+    demand = 18.0 * np.ones(T)
+    demand += 10.0 * triangular_pulse(T, 15, 30, 65, severity)
+    return demand, x
+
+
+def make_persistent_degradation_scenario(
+    T: int = 160,
+    severity: float = 0.5,
+    kind: str = "weather"
+) -> Tuple[np.ndarray, np.ndarray]:
+    weather = np.zeros(T)
+    incident = np.zeros(T)
+    event = np.zeros(T)
+
+    if kind == "weather":
+        weather = persistent_level(T, 0.9 * severity, start=15)
+    elif kind == "incident":
+        incident = persistent_level(T, 1.0 * severity, start=20)
+    elif kind == "event":
+        event = persistent_level(T, 0.9 * severity, start=15)
+    elif kind == "mixed":
+        weather = persistent_level(T, 0.5 * severity, start=15)
+        incident = persistent_level(T, 0.8 * severity, start=25)
+        event = persistent_level(T, 0.6 * severity, start=15)
+    else:
+        raise ValueError("Unknown persistent scenario kind.")
+
+    x = np.vstack([weather, incident, event]).T
+
+    demand = 17.0 * np.ones(T)
+    if kind in ["event", "mixed"]:
+        demand += 6.0 * severity
+
+    return demand, x
+
+
+# ============================================================
+# 5. SIMULATION ENGINE
+# ============================================================
+
+def run_simulation(params: NetworkParams, cfg: SimConfig) -> pd.DataFrame:
+    controller = CONTROLLERS[cfg.controller_name]
+
+    q = np.zeros(4, dtype=float)
+    u_prev = np.array([0.5, 1.0], dtype=float)
+
+    rows = []
+
+    for t in range(cfg.T):
+        x_t = cfg.context_profile[t]
+        d_t = cfg.demand_profile[t]
+
+        u_t = controller(
+            q=q.copy(),
+            demand=d_t,
+            x_true=x_t.copy(),
+            t=t,
+            params=params,
+            u_prev=u_prev.copy(),
+            info_mode=cfg.info_mode,
+            forecast_noise_std=cfg.forecast_noise_std,
+        )
+
+        q_next, sim_metrics = simulate_one_step(q, d_t, x_t, u_t, params)
+        caps = contextual_capacities(params.base_caps, x_t)
+
+        row = {
+            "t": t,
+            "controller": cfg.controller_name,
+            "severity": cfg.severity_label,
+            "info_mode": cfg.info_mode,
+            "demand": d_t,
+            "weather": x_t[0],
+            "incident": x_t[1],
+            "event": x_t[2],
+            "q0": q[0],
+            "q1": q[1],
+            "q2": q[2],
+            "q3": q[3],
+            "queue_total": float(np.sum(q)),
+            "queue_max": float(np.max(q)),
+            "alpha": float(u_t[0]),
+            "meter": float(u_t[1]),
+            "throughput": sim_metrics["throughput"],
+            "inflow": sim_metrics["inflow"],
+            "spillback_links": sim_metrics["spillback_links"],
+            "cap_mean": sim_metrics["caps_mean"],
+            "cap_route_a": sim_metrics["caps_route_a"],
+            "cap_route_b": sim_metrics["caps_route_b"],
+            "stage_cost": stage_cost(q, u_t, caps, params.free_flow_cost, smooth_u_prev=u_prev),
+        }
+        rows.append(row)
+
+        q = q_next
+        u_prev = u_t
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 6. PERFORMANCE METRICS
+# ============================================================
+
+def summarize_performance(df: pd.DataFrame) -> pd.Series:
+    """
+    Aggregate metrics for a single controller-scenario dataframe.
+    """
+    total_queue = df["queue_total"].sum()
+    max_queue = df["queue_max"].max()
+    avg_delay_proxy = df["queue_total"].mean()
+    avg_throughput = df["throughput"].mean()
+    total_throughput = df["throughput"].sum()
+    spillback_time = (df["spillback_links"] > 0).sum()
+
+    # recovery time proxy:
+    # after the shock peak, when total queue falls below 110% of pre-shock average
+    pre = df[df["t"] < max(10, int(0.15 * len(df)))]
+    baseline_q = pre["queue_total"].mean() + EPS
+    threshold = 1.10 * baseline_q
+
+    post_peak_t = int(df["queue_total"].idxmax())
+    recovery_t = np.nan
+    for k in range(post_peak_t, len(df)):
+        if df.iloc[k]["queue_total"] <= threshold:
+            recovery_t = int(df.iloc[k]["t"] - df.iloc[post_peak_t]["t"])
+            break
+
+    return pd.Series({
+        "total_queue": total_queue,
+        "max_queue": max_queue,
+        "avg_delay_proxy": avg_delay_proxy,
+        "avg_throughput": avg_throughput,
+        "total_throughput": total_throughput,
+        "spillback_time": spillback_time,
+        "recovery_time": recovery_t,
+    })
+
+
+# ============================================================
+# 7. PLOTTING HELPERS
+# ============================================================
+
+def plot_time_series(
+    dfs: Dict[str, pd.DataFrame],
+    value_col: str,
+    title: str,
+    ylabel: str,
+):
+    plt.figure()
+    for name, df in dfs.items():
+        plt.plot(df["t"], df[value_col], label=name)
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_context(df: pd.DataFrame, title: str = "Context profile"):
+    plt.figure()
+    plt.plot(df["t"], df["weather"], label="weather")
+    plt.plot(df["t"], df["incident"], label="incident")
+    plt.plot(df["t"], df["event"], label="event")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Context intensity")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# 8. EXPERIMENT 1
+# ============================================================
+
+def experiment_1_transient_stabilization(params: NetworkParams) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    print("\n=== Experiment 1: Stabilization under transient contextual shocks ===")
+
+    T = 120
+    demand, x = make_transient_shock_scenario(T=T, severity=0.85)
+
+    all_dfs = {}
+    for name in ["no_control", "static", "state_feedback", "predict_then_optimize", "contextual_hjb"]:
+        cfg = SimConfig(
+            T=T,
+            demand_profile=demand,
+            context_profile=x,
+            controller_name=name,
+            forecast_noise_std=0.12,
+            info_mode="full",
+            severity_label="transient_high",
+        )
+        df = run_simulation(params, cfg)
+        all_dfs[name] = df
+
+    summary = pd.concat(
+        {name: summarize_performance(df) for name, df in all_dfs.items()},
+        axis=1
+    ).T
+
+    print(summary.sort_values("total_queue"))
+
+    plot_context(next(iter(all_dfs.values())), title="Experiment 1 Context Profile")
+    plot_time_series(all_dfs, "queue_total", "Experiment 1: Total Queue Length", "Total queue")
+    plot_time_series(all_dfs, "throughput", "Experiment 1: Network Throughput", "Throughput")
+    plot_time_series(all_dfs, "stage_cost", "Experiment 1: Stage Cost", "Stage cost")
+
+    return summary, all_dfs
+
+
+# ============================================================
+# 9. EXPERIMENT 2
+# ============================================================
+
+def experiment_2_throughput_recovery(params: NetworkParams) -> pd.DataFrame:
+    print("\n=== Experiment 2: Throughput recovery under persistent degradation ===")
+
+    severities = [0.25, 0.50, 0.75, 1.00]
+    controllers = ["static", "state_feedback", "predict_then_optimize", "contextual_hjb"]
+
+    rows = []
+
+    for sev in severities:
+        demand, x = make_persistent_degradation_scenario(T=160, severity=sev, kind="mixed")
+
+        for ctrl in controllers:
+            cfg = SimConfig(
+                T=160,
+                demand_profile=demand,
+                context_profile=x,
+                controller_name=ctrl,
+                forecast_noise_std=0.12,
+                info_mode="full",
+                severity_label=f"{sev:.2f}",
+            )
+            df = run_simulation(params, cfg)
+            s = summarize_performance(df)
+            rows.append({
+                "severity": sev,
+                "controller": ctrl,
+                **s.to_dict()
+            })
+
+    res = pd.DataFrame(rows)
+    print(res.head())
+
+    plt.figure()
+    for ctrl in controllers:
+        sub = res[res["controller"] == ctrl].sort_values("severity")
+        plt.plot(sub["severity"], sub["avg_throughput"], marker="o", label=ctrl)
+    plt.title("Experiment 2: Average Throughput vs Disturbance Severity")
+    plt.xlabel("Disturbance severity")
+    plt.ylabel("Average throughput")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    for ctrl in controllers:
+        sub = res[res["controller"] == ctrl].sort_values("severity")
+        plt.plot(sub["severity"], sub["max_queue"], marker="o", label=ctrl)
+    plt.title("Experiment 2: Peak Queue vs Disturbance Severity")
+    plt.xlabel("Disturbance severity")
+    plt.ylabel("Max queue")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return res
+
+
+# ============================================================
+# 10. EXPERIMENT 3
+# ============================================================
+
+def experiment_3_value_of_context(params: NetworkParams) -> pd.DataFrame:
+    print("\n=== Experiment 3: Value of contextual information ===")
+
+    T = 140
+    demand, x = make_transient_shock_scenario(T=T, severity=0.75)
+
+    rows = []
+
+    # Compare contextual_hjb and predict_then_optimize under different information regimes
+    for controller_name in ["predict_then_optimize", "contextual_hjb"]:
+        for info_mode in ["none", "partial", "full"]:
+            cfg = SimConfig(
+                T=T,
+                demand_profile=demand,
+                context_profile=x,
+                controller_name=controller_name,
+                forecast_noise_std=0.15,
+                info_mode=info_mode,
+                severity_label="context_value",
+            )
+            df = run_simulation(params, cfg)
+            s = summarize_performance(df)
+            rows.append({
+                "controller": controller_name,
+                "info_mode": info_mode,
+                **s.to_dict()
+            })
+
+    res = pd.DataFrame(rows)
+    print(res)
+
+    for metric, ylabel in [
+        ("total_queue", "Total queue"),
+        ("avg_throughput", "Average throughput"),
+        ("recovery_time", "Recovery time"),
+    ]:
+        plt.figure()
+        for ctrl in ["predict_then_optimize", "contextual_hjb"]:
+            sub = res[res["controller"] == ctrl]
+            x_pos = np.arange(len(sub))
+            plt.plot(sub["info_mode"], sub[metric], marker="o", label=ctrl)
+        plt.title(f"Experiment 3: {ylabel} across information regimes")
+        plt.xlabel("Information regime")
+        plt.ylabel(ylabel)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return res
+
+
+# ============================================================
+# 11. EXPERIMENT 4
+# ============================================================
+
+def generate_training_data_for_surrogate(
+    params: NetworkParams,
+    n_samples: int = 5000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Learn a surrogate imitation of the contextual_hjb policy:
+    input  -> [q0,q1,q2,q3, demand, weather, incident, event]
+    output -> [alpha, meter]
+    """
+    X, Y = [], []
+
+    for _ in range(n_samples):
+        q = np.random.uniform(0.0, params.storage_caps)
+        demand = np.random.uniform(10.0, 28.0)
+        x = np.random.uniform(0.0, 1.0, size=3)
+
+        u = controller_contextual_hjb(
+            q=q,
+            demand=demand,
+            x_true=x,
+            t=0,
+            params=params,
+            u_prev=np.array([0.5, 1.0]),
+            info_mode="full",
+            forecast_noise_std=0.0,
+        )
+
+        X.append(np.concatenate([q, [demand], x]))
+        Y.append(u)
+
+    return np.array(X), np.array(Y)
+
+
+def experiment_4_surrogate_policy(params: NetworkParams) -> Dict[str, float]:
+    print("\n=== Experiment 4: Surrogate-policy timing study ===")
+
+    X, Y = generate_training_data_for_surrogate(params, n_samples=4000)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.20, random_state=42)
+
+    model = MLPRegressor(
+        hidden_layer_sizes=(64, 64),
+        activation="relu",
+        solver="adam",
+        max_iter=300,
+        random_state=42,
+    )
+
+    t0 = time.time()
+    model.fit(X_train, y_train)
+    train_time = time.time() - t0
+
+    pred = model.predict(X_test)
+    imitation_mse = mean_squared_error(y_test, pred)
+
+    # Timing direct HJB-inspired controller vs surrogate
+    n_eval = 1000
+    eval_states = X_test[:n_eval]
+
+    t0 = time.time()
+    for row in eval_states:
+        q = row[:4]
+        demand = row[4]
+        x = row[5:]
+        _ = controller_contextual_hjb(
+            q=q,
+            demand=demand,
+            x_true=x,
+            t=0,
+            params=params,
+            u_prev=np.array([0.5, 1.0]),
+            info_mode="full",
+        )
+    direct_time = time.time() - t0
+
+    t0 = time.time()
+    _ = model.predict(eval_states)
+    surrogate_time = time.time() - t0
+
+    results = {
+        "surrogate_train_time_sec": train_time,
+        "policy_imitation_mse": imitation_mse,
+        "direct_controller_eval_time_sec": direct_time,
+        "surrogate_eval_time_sec": surrogate_time,
+        "speedup_factor": direct_time / max(surrogate_time, EPS),
+    }
+
+    print(results)
+    return results
+
+
+# ============================================================
+# 12. MAIN
+# ============================================================
+
+def main():
+    params = NetworkParams(
+        base_caps=np.array([14.0, 14.0, 12.0, 12.0]),
+        storage_caps=np.array([60.0, 60.0, 60.0, 60.0]),
+        free_flow_cost=np.array([1.0, 1.0, 1.2, 1.2]),
+        dt=1.0,
+    )
+
+    # Experiment 1
+    exp1_summary, exp1_dfs = experiment_1_transient_stabilization(params)
+
+    # Experiment 2
+    exp2_results = experiment_2_throughput_recovery(params)
+
+    # Experiment 3
+    exp3_results = experiment_3_value_of_context(params)
+
+    # Experiment 4
+    exp4_results = experiment_4_surrogate_policy(params)
+
+    # Save tables
+    exp1_summary.to_csv("exp1_summary.csv")
+    exp2_results.to_csv("exp2_results.csv", index=False)
+    exp3_results.to_csv("exp3_results.csv", index=False)
+    pd.DataFrame([exp4_results]).to_csv("exp4_results.csv", index=False)
+
+    print("\nSaved:")
+    print(" - exp1_summary.csv")
+    print(" - exp2_results.csv")
+    print(" - exp3_results.csv")
+    print(" - exp4_results.csv")
+
+
+if __name__ == "__main__":
+    main()
