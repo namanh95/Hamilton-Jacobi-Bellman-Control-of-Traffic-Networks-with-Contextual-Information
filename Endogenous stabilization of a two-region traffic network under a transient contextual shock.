@@ -1,0 +1,132 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. LOAD THE TRAINED HJB CONTROLLER
+# ==========================================
+# (Make sure the MFD_Contextual_PINN class is defined in your script above this)
+pinn = MFD_Contextual_PINN()
+pinn.load_state_dict(torch.load("mfd_hjb_controller.pth", weights_only=True))
+pinn.eval() # Set to evaluation mode
+
+# ==========================================
+# 2. SIMULATION SETUP
+# ==========================================
+T_obs = 120.0       # 120 minutes
+dt = 0.5            # 30-second time steps
+time_steps = int(T_obs / dt)
+time_array = np.linspace(0, T_obs, time_steps)
+
+n_jam = 10000.0
+v_free = 40.0
+omega = 0.1
+
+# Initialize arrays to log data for our TR-B plots
+n1_history = np.zeros(time_steps)
+n2_history = np.zeros(time_steps)
+u_history = np.zeros(time_steps)
+x_history = np.zeros(time_steps)
+
+# Start with moderate congestion in both regions
+n1_current = 4000.0 
+n2_current = 3000.0
+
+print("Initiating Contextual HJB Live Simulation...")
+
+# ==========================================
+# 3. LIVE SIMULATION LOOP
+# ==========================================
+for i, t in enumerate(time_array):
+    
+    # A. The Contextual Shock: A storm peaking at t=60 minutes
+    # Modeled as a Gaussian bell curve
+    x_t = np.exp(-((t - 60.0)**2) / (2 * 15.0**2))
+    
+    # Log the current states
+    n1_history[i] = n1_current
+    n2_history[i] = n2_current
+    x_history[i] = x_t
+    
+    # B. Extract Optimal Policy u* from the PINN
+    # We must enable gradients even during inference to get the costate p
+    # B. Extract Optimal Policy u* from the PINN
+    # B. Extract Optimal Policy u* from the PINN
+    with torch.enable_grad():
+        n1_tensor = torch.tensor([[n1_current]], dtype=torch.float32, requires_grad=True)
+        n2_tensor = torch.tensor([[n2_current]], dtype=torch.float32, requires_grad=True)
+        x_tensor = torch.tensor([[x_t]], dtype=torch.float32)
+        t_tensor = torch.tensor([[t]], dtype=torch.float32)
+        
+        # Forward pass to get Value J
+        J = pinn(n1_tensor, n2_tensor, x_tensor, t_tensor)
+        
+        # FIX: Calculate gradients (costates p1, p2) simultaneously!
+        grads = torch.autograd.grad(J, (n1_tensor, n2_tensor), create_graph=False)
+        p1 = grads[0].item()
+        p2 = grads[1].item()
+    # Macroscopic Demand from Region 2 to Region 1
+    P2 = v_free * n2_current * (1.0 - n2_current / n_jam)
+    M21_demand = 0.3 * P2
+    
+    # Endogenous Control Law (Theorem 1)
+    u_star = (M21_demand * (p2 - p1)) / omega
+    u_star = np.clip(u_star, 0.0, 1.0) # Physical boundary constraint
+    u_history[i] = u_star
+    
+    # C. Euler Update for Macroscopic Physics
+    capacity_deg = 1.0 - 0.5 * x_t
+    P1 = capacity_deg * v_free * n1_current * (1.0 - n1_current / n_jam)
+    
+    M1_out = 0.4 * P1
+    M2_out = 0.3 * P2
+    
+    demand_1 = 500.0
+    demand_2 = 400.0
+    
+    dn1_dt = demand_1 - M1_out + u_star * M21_demand
+    dn2_dt = demand_2 - M2_out - u_star * M21_demand
+    
+    # Step forward in time (scaled by dt)
+    # Scaling factor 0.01 applied to keep accumulations stable for the mock parameters
+    n1_current = np.clip(n1_current + dn1_dt * dt * 0.01, 0, n_jam)
+    n2_current = np.clip(n2_current + dn2_dt * dt * 0.01, 0, n_jam)
+
+print("Simulation Complete. Generating TR-B Figures...")
+
+# ==========================================
+# 4. PLOTTING RESULTS FOR MANUSCRIPT
+# ==========================================
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+# Plot 1: Regional Accumulation and the Storm
+ax1.plot(time_array, n1_history, label='Region 1 (Urban Core)', color='red', linewidth=2)
+ax1.plot(time_array, n2_history, label='Region 2 (Periphery)', color='blue', linewidth=2)
+ax1.set_ylabel("Vehicle Accumulation $n(t)$")
+ax1.set_title("Endogenous Stabilization under Contextual Shock")
+ax1.grid(True)
+
+# Create a twin axis for the weather shock
+ax1_twin = ax1.twinx()
+ax1_twin.fill_between(time_array, 0, x_history, color='gray', alpha=0.3, label='Weather Shock Intensity $x(t)$')
+ax1_twin.set_ylabel("Shock Intensity", color='gray')
+
+# Combine legends for top plot
+lines_1, labels_1 = ax1.get_legend_handles_labels()
+lines_2, labels_2 = ax1_twin.get_legend_handles_labels()
+ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
+
+# Plot 2: The Optimal Control Policy
+ax2.plot(time_array, u_history, label='Metering Policy $u^*(t)$', color='purple', linewidth=2)
+ax2.set_xlabel("Time (minutes)")
+ax2.set_ylabel("Metering Rate")
+ax2.set_ylim(-0.1, 1.1)
+ax2.grid(True)
+ax2.legend(loc='upper right')
+
+plt.tight_layout()
+plt.show()
+
+# Calculate Total System Travel Time (TSTT) for Table 1
+TSTT = np.sum(n1_history + n2_history) * dt / 60.0
+print(f"Total System Travel Time (TSTT): {TSTT:.2f} vehicle-hours")
