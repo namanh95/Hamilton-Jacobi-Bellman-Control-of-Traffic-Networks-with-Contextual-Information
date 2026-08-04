@@ -14,6 +14,8 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: python -m pip install --upgrade pip numpy pandas matplotlib scipy torch
+      - name: Apply NumPy 2 compatibility patch
+        run: sed -i 's/np\.trapz/np.trapezoid/g' stochastic_hjb_pinn.py
       - name: Compile script
         run: python -m py_compile stochastic_hjb_pinn.py
       - name: Run reduced smoke test
