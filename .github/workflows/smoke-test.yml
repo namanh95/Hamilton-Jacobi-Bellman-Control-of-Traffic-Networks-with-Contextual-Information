@@ -1,0 +1,54 @@
+name: stochastic-hjb-pinn-smoke-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'stochastic_hjb_pinn.py'
+      - '.github/workflows/smoke-test.yml'
+  push:
+    paths:
+      - 'stochastic_hjb_pinn.py'
+      - '.github/workflows/smoke-test.yml'
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip numpy pandas matplotlib scipy torch
+      - name: Compile script
+        run: python -m py_compile stochastic_hjb_pinn.py
+      - name: Run reduced smoke test
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python stochastic_hjb_pinn.py \
+            --epochs 2 \
+            --n-interior 64 \
+            --n-terminal 32 \
+            --n-validation 32 \
+            --n-test 64 \
+            --mc-paths 2 \
+            --device cpu \
+            --output smoke_results
+      - name: Check outputs
+        run: |
+          test -s smoke_results/training_history.csv
+          test -s smoke_results/test_metrics.csv
+          test -s smoke_results/monte_carlo_trajectories.csv
+          test -s smoke_results/policy_summary.csv
+          test -s smoke_results/run_metadata.json
+          test -s smoke_results/figure_training_convergence.png
+          test -s smoke_results/figure_stochastic_accumulation.png
+      - name: Upload smoke-test outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: stochastic-hjb-pinn-smoke-results
+          path: smoke_results/
