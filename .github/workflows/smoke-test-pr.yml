@@ -6,7 +6,7 @@ on:
 jobs:
   smoke-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,31 +14,55 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: python -m pip install --upgrade pip numpy pandas matplotlib scipy torch
+      - name: Apply mass-consistent numerical patches
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('stochastic_hjb_pinn.py')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('np.trapz', 'np.trapezoid')
+          old = '''        barrier = 0.02 * ((q1 / torch.clamp(1.0 - q1, min=1e-3)) ** 2 +\n                          (q2 / torch.clamp(1.0 - q2, min=1e-3)) ** 2)\n        return c.w1 * q1**2 + c.w2 * q2**2 + c.control_weight * u**2 + barrier'''
+          new = '''        barrier = 0.05 * (q1**4 + q2**4)\n        return c.w1 * q1**2 + c.w2 * q2**2 + c.control_weight * (1.0 - u)**2 + barrier'''
+          if old not in s:
+              raise SystemExit('Expected stage-cost block was not found')
+          s = s.replace(old, new)
+          old = '''    def optimal_control(self, jn1: Tensor, n2: Tensor) -> Tensor:\n        \"\"\"Analytic Hamiltonian minimizer for affine drift and quadratic effort.\n\n        f1 contains +u*P2(n2), while the running cost contains r*u^2.\n        Thus u_unc = -J_n1*P2/(2r), projected to [0,u_max].\n        \"\"\"\n        p2 = self.production2(n2)\n        u_unc = -(jn1 * p2) / (2.0 * self.cfg.control_weight)\n        return torch.clamp(u_unc, 0.0, self.cfg.u_max)'''
+          new = '''    def optimal_control(self, jn1: Tensor, jn2: Tensor, n2: Tensor) -> Tensor:\n        \"\"\"Mass-consistent Hamiltonian minimizer with closure penalty.\"\"\"\n        transfer = self.production2(n2)\n        u_unc = 1.0 - transfer * (jn1 - jn2) / (2.0 * self.cfg.control_weight)\n        return torch.clamp(u_unc, 0.0, self.cfg.u_max)'''
+          if old not in s:
+              raise SystemExit('Expected optimal-control block was not found')
+          s = s.replace(old, new)
+          s = s.replace('u = self.optimal_control(d["jn1"], n2)', 'u = self.optimal_control(d["jn1"], d["jn2"], n2)')
+          s = s.replace('f2 = self.demand(t) - p2', 'g2 = 0.30 * p2\n        f2 = self.demand(t) - u * p2 - g2')
+          s = s.replace('u = model.optimal_control(grad[:, 0:1], n2)', 'u = model.optimal_control(grad[:, 0:1], grad[:, 1:2], n2)')
+          s = s.replace('f2 = demand - p2', 'g2 = 0.30 * p2\n            f2 = demand - u * p2 - g2')
+          s = s.replace('validation_every: int = 100', 'validation_every: int = 50')
+          p.write_text(s, encoding='utf-8')
+          PY
       - name: Compile script
         run: python -m py_compile stochastic_hjb_pinn.py
-      - name: Run reduced smoke test
+      - name: Run 2000-epoch validation
         env:
           MPLBACKEND: Agg
         run: |
           python stochastic_hjb_pinn.py \
-            --epochs 2 \
-            --n-interior 64 \
-            --n-terminal 32 \
-            --n-validation 32 \
-            --n-test 64 \
-            --mc-paths 2 \
+            --epochs 2000 \
+            --n-interior 5000 \
+            --n-terminal 1000 \
+            --n-validation 1000 \
+            --n-test 2000 \
+            --mc-paths 50 \
             --device cpu \
-            --output smoke_results
+            --output validation_2000_results
       - name: Check outputs
         run: |
-          test -s smoke_results/training_history.csv
-          test -s smoke_results/test_metrics.csv
-          test -s smoke_results/monte_carlo_trajectories.csv
-          test -s smoke_results/policy_summary.csv
-          test -s smoke_results/run_metadata.json
-          test -s smoke_results/figure_training_convergence.png
-          test -s smoke_results/figure_stochastic_accumulation.png
+          test -s validation_2000_results/training_history.csv
+          test -s validation_2000_results/test_metrics.csv
+          test -s validation_2000_results/monte_carlo_trajectories.csv
+          test -s validation_2000_results/policy_summary.csv
+          test -s validation_2000_results/run_metadata.json
+          test -s validation_2000_results/figure_training_convergence.png
+          test -s validation_2000_results/figure_stochastic_accumulation.png
       - uses: actions/upload-artifact@v4
         with:
-          name: stochastic-hjb-pinn-smoke-results
-          path: smoke_results/
+          name: stochastic-hjb-pinn-validation-2000-results
+          path: validation_2000_results/
