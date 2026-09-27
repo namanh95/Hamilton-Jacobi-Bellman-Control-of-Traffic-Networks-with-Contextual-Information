@@ -1,0 +1,5 @@
+{
+  "resume_checkpoint_max_weight_difference": 0.0,
+  "passed": true,
+  "includes": "4 Adam epochs and 2 L-BFGS steps, interrupted after epoch 1"
+}

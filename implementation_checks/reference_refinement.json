@@ -1,0 +1,40 @@
+{
+  "initial_values": {
+    "base": {
+      "nominal": 168.96054513347516,
+      "congested": 307.6981641266255
+    },
+    "space": {
+      "nominal": 168.3591004803538,
+      "congested": 306.9993857744293
+    },
+    "time": {
+      "nominal": 168.96564376383654,
+      "congested": 307.689755935344
+    },
+    "action": {
+      "nominal": 168.95992316105279,
+      "congested": 307.6968990423188
+    }
+  },
+  "comparisons": {
+    "space_minus_base": {
+      "rmse": 1.1207479042333242,
+      "max_abs": 4.4715865030869395,
+      "relative_l2": 0.004562926219194058
+    },
+    "time_minus_base": {
+      "rmse": 0.006738179898675718,
+      "max_abs": 0.018851002819189944,
+      "relative_l2": 2.7329548822452957e-05
+    },
+    "action_minus_base": {
+      "rmse": 0.0010407144795447662,
+      "max_abs": 0.0021263430089106805,
+      "relative_l2": 4.221048858202572e-06
+    }
+  },
+  "points": 10000,
+  "time": 0,
+  "caveat": "Grid differences, not an exact-error certificate."
+}
