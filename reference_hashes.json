@@ -1,0 +1,10 @@
+{
+  "sha256": {
+    "reference_base.npz": "8fa0d44713da34f4685fdac531c2375e1cf8a31b25b7e3612208f0febc0d2d30",
+    "reference_fine.npz": "67a281a0001a8866282668168a98b20d0698d8f813882e1f65036f562bb26475",
+    "reference_space.npz": "687d7be409332824afed9c32d54b6ace6bbce916426cb8aacde21a42d69e9d83",
+    "reference_time.npz": "6aef69b9a364d3879c49e5f23e33086e16b3e563174022f12f315fb15d552a17",
+    "reference_action.npz": "feb9983d71082c216d9ae75332fca3feeb615d3c580d13f7e98f66c43dab2930"
+  },
+  "note": "Large reference arrays are not bundled. Regenerate via code_budget500/run_study.py --task references --root budget500 --epochs 500 --lbfgs-steps 0. Reference diagnostics are included."
+}
