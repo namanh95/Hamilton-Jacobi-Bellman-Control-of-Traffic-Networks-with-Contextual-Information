@@ -1,0 +1,10 @@
+{
+  "points": 10000,
+  "value_rmse": 1.015341924245372,
+  "value_relative_l2": 0.007028636974041515,
+  "value_sample_max": 6.278929400341951,
+  "policy_rmse": 0.040929042818933364,
+  "reference": "results/ref17.npz",
+  "checkpoint": "results/hard_pilot_seed11/best.pt",
+  "note": "Approximate grid reference; not a uniform error bound."
+}

@@ -1,0 +1,12 @@
+{
+  "status": "COMPLETED",
+  "test": {
+    "interior_mse": 0.0013625185451970653,
+    "face_mse": 0.0022099805879518147,
+    "terminal_mse": 0.0,
+    "interior_sample_max": 0.2549093456413148,
+    "face_sample_max": 0.450936638439847,
+    "terminal_sample_max": 0.0,
+    "total": 0.0016450058927819818
+  }
+}

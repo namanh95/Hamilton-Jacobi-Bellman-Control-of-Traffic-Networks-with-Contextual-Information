@@ -1,0 +1,9 @@
+{
+  "interior_mse": 2.9123950099432814,
+  "face_mse": 3.109679507468177,
+  "terminal_mse": 0.025124082469137193,
+  "interior_sample_max": 11.496391423585901,
+  "face_sample_max": 11.886782376764142,
+  "terminal_sample_max": 0.4254916327732092,
+  "total": 3.2293973338096182
+}

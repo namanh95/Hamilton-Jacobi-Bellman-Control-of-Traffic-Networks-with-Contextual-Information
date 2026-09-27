@@ -1,0 +1,43 @@
+{
+  "config": {
+    "K1": 4000.0,
+    "K2": 4000.0,
+    "T": 60.0,
+    "beta1": 0.055,
+    "beta2": 0.05,
+    "alpha": 0.6,
+    "gamma": 0.55,
+    "kappa": 0.35,
+    "eta": 0.16,
+    "sigma1": 70.0,
+    "sigma2": 70.0,
+    "w1": 1.0,
+    "w2": 0.7,
+    "ru": 0.2,
+    "bj": 0.2,
+    "lost_weight": 5.0,
+    "terminal_weight": 1.0,
+    "demand_ref": 55.0,
+    "demand_multiplier": 1.0
+  },
+  "arguments": {
+    "config": null,
+    "seed": 11,
+    "epochs": 200,
+    "n_interior": 20000,
+    "n_terminal": 2000,
+    "n_validation": 5000,
+    "n_test": 10000,
+    "batch_size": 1024,
+    "validation_every": 10,
+    "lbfgs_steps": 30,
+    "device": "cpu",
+    "output": "results/pilot_seed11"
+  },
+  "torch_version": "2.14.0+cpu",
+  "numpy_version": "2.3.5",
+  "seconds": 288.2266600459998,
+  "selected_epoch": 200,
+  "selected_phase": "adam",
+  "uniform_certificate": false
+}
